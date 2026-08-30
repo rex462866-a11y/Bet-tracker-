@@ -406,12 +406,12 @@
   <div class="tab-panel" id="tab-live">
 
     <div class="bankroll" style="margin-bottom:16px;">
-      <div class="bankroll-label">API-Football Key (used securely through Netlify Function)</div>
+      <div class="bankroll-label">API-Football Key (optional — enables direct live scores)</div>
       <div class="row" style="margin-top:8px;">
         <input type="password" id="apiKeyInput" placeholder="Paste your API-Football key">
         <button type="button" id="saveApiKeyBtn" style="margin-top:0; width:auto; padding:0 14px;">Save</button>
       </div>
-      <div style="font-size:11px; color:#8a94a3; margin-top:6px;">Used by this tracker to request scores through your Netlify Function. For best security, also set API_FOOTBALL_KEY in Netlify environment variables.</div>
+      <div style="font-size:11px; color:#8a94a3; margin-top:6px;">Stored only in this tracker's private storage. Never sent to Claude or anywhere else.</div>
       <div id="apiKeyStatus" style="font-size:12px; margin-top:6px;"></div>
     </div>
 
@@ -495,6 +495,31 @@
 </div>
 
 <script>
+// Claude's artifact environment provides window.storage automatically.
+// Outside that environment (like this standalone hosted site), it doesn't exist —
+// so we provide a compatible version backed by the browser's own localStorage.
+if (!window.storage) {
+  window.storage = {
+    async get(key) {
+      const val = localStorage.getItem(key);
+      if (val === null) throw new Error('Key not found: ' + key);
+      return { key, value: val };
+    },
+    async set(key, value) {
+      localStorage.setItem(key, value);
+      return { key, value };
+    },
+    async delete(key) {
+      localStorage.removeItem(key);
+      return { key, deleted: true };
+    },
+    async list(prefix) {
+      const keys = Object.keys(localStorage).filter(k => !prefix || k.startsWith(prefix));
+      return { keys };
+    }
+  };
+}
+
 let entries = [];
 let slips = [];
 let balance = 2500;
@@ -511,8 +536,8 @@ function scoreKey(match, date) {
 
 async function loadScores() {
   try {
-    const raw = localStorage.getItem('match-scores');
-    matchScores = raw ? JSON.parse(raw) : {};
+    const result = await window.storage.get('match-scores');
+    matchScores = result ? JSON.parse(result.value) : {};
   } catch (e) {
     matchScores = {};
   }
@@ -525,7 +550,7 @@ async function loadScores() {
   }
   if (changed) {
     try {
-      localStorage.setItem('match-scores', JSON.stringify(matchScores));
+      await window.storage.set('match-scores', JSON.stringify(matchScores));
     } catch (e) {
       console.error('Save failed', e);
     }
@@ -598,7 +623,10 @@ async function refreshAll() {
 async function loadApiKey() {
   if (sessionApiKey) return sessionApiKey;
   try {
-    sessionApiKey = localStorage.getItem('api-football-key') || '';
+    const result = await window.storage.get('api-football-key');
+    if (result && result.value) {
+      sessionApiKey = result.value;
+    }
   } catch (e) {
     // Persistent storage unavailable this session — that's OK, sessionApiKey still works.
   }
@@ -608,7 +636,7 @@ async function loadApiKey() {
 async function saveApiKey(key) {
   sessionApiKey = key;
   try {
-    localStorage.setItem('api-football-key', key);
+    await window.storage.set('api-football-key', key);
     return true;
   } catch (e) {
     console.error('Persistent save failed (key will still work this session):', e);
@@ -651,90 +679,63 @@ async function fetchLiveScoresFromApi(apiKey) {
 
   let matchedCount = 0;
   let fetchError = null;
-  let apiFixtureCount = 0;
-  const unmatched = [];
+  let sampleApiNames = [];
 
   for (const date of uniqueDates) {
     try {
-      const resp = await fetch(`/.netlify/functions/scores?date=${encodeURIComponent(date)}`, {
-        method: 'GET',
-        headers: {
-          'x-client-api-key': apiKey,
-          'Accept': 'application/json'
-        }
-      });
+      const resp = await fetch(`/.netlify/functions/scores?date=${encodeURIComponent(date)}`);
       if (!resp.ok) {
-        let detail = '';
-        try { detail = await resp.text(); } catch (_) {}
-        fetchError = `Scores function returned ${resp.status}${detail ? ': ' + detail.slice(0,160) : ''}`;
+        fetchError = `API error: ${resp.status}`;
         continue;
       }
       const data = await resp.json();
       const fixtures = data.response || [];
-      apiFixtureCount += fixtures.length;
+
+      if (sampleApiNames.length === 0 && fixtures.length > 0) {
+        sampleApiNames = fixtures.slice(0, 6).map(f => `${f.teams.home.name} vs ${f.teams.away.name}`);
+      }
 
       for (const entry of pendingEntries.filter(e => e.date === date)) {
-        const parts = entry.match.split(/\s+vs\s+/i);
-        if (parts.length !== 2) { unmatched.push(entry.match); continue; }
-        const [homeGuess, awayGuess] = parts.map(x => x.trim());
+        const parts = entry.match.split(' vs ');
+        if (parts.length !== 2) continue;
+        const [homeGuess, awayGuess] = parts;
 
         const fixture = fixtures.find(f =>
-          teamNameMatch(f.teams?.home?.name, homeGuess) &&
-          teamNameMatch(f.teams?.away?.name, awayGuess)
+          namesLooselyMatch(f.teams.home.name, homeGuess) &&
+          namesLooselyMatch(f.teams.away.name, awayGuess)
         );
 
         if (fixture) {
-          const score = `${fixture.goals?.home ?? 0}-${fixture.goals?.away ?? 0}`;
+          const score = `${fixture.goals.home ?? 0}-${fixture.goals.away ?? 0}`;
           const status = formatFixtureStatus(fixture);
           const key = scoreKey(entry.match, entry.date);
-          matchScores[key] = {
-            score,
-            status,
-            fixtureId: fixture.fixture?.id,
-            minute: fixture.fixture?.status?.elapsed ?? null,
-            home: fixture.teams?.home?.name || homeGuess,
-            away: fixture.teams?.away?.name || awayGuess,
-            kickoff: fixture.fixture?.date || null
-          };
+          matchScores[key] = { score, status };
           matchedCount++;
-        } else {
-          unmatched.push(entry.match);
         }
       }
     } catch (e) {
-      fetchError = 'Could not reach /.netlify/functions/scores. Make sure netlify/functions/scores.js is committed and Netlify has redeployed.';
+      fetchError = 'Could not reach the scores function — check the netlify.toml and functions folder deployed correctly.';
     }
   }
 
-  try { localStorage.setItem('match-scores', JSON.stringify(matchScores)); } catch (_) {}
+  try {
+    await window.storage.set('match-scores', JSON.stringify(matchScores));
+  } catch (e) {
+    console.error('Save failed', e);
+  }
 
   if (statusEl) {
     if (fetchError) {
-      statusEl.innerHTML = `⚠️ ${escapeHtml(fetchError)}`;
+      statusEl.innerHTML = `⚠️ ${fetchError} If this persists, the API may be blocking direct browser calls — ask Claude to fetch scores instead.`;
       statusEl.style.color = '#f87171';
-    } else if (matchedCount === 0 && pendingEntries.length > 0) {
-      statusEl.innerHTML = `⚠️ API connected (${apiFixtureCount} fixtures returned), but 0 of ${pendingEntries.length} legs matched. Check the match date/team names.`;
+    } else if (matchedCount === 0 && sampleApiNames.length > 0) {
+      statusEl.innerHTML = `⚠️ Matched 0 of ${pendingEntries.length} — names aren't lining up. API returned matches like: ${escapeHtml(sampleApiNames.join(' | '))}`;
       statusEl.style.color = '#fbbf24';
     } else {
-      statusEl.textContent = `✅ API connected · Matched ${matchedCount} of ${pendingEntries.length} pending legs.`;
+      statusEl.textContent = `✅ Matched ${matchedCount} of ${pendingEntries.length} pending legs.`;
       statusEl.style.color = '#4ade80';
     }
   }
-}
-
-function teamTokens(name) {
-  const stop = new Set(['fc','cf','sc','sv','afc','ac','club','fk','cd','the','de','da','do','la','el','al']);
-  return normalizeTeamName(name).split(/[^a-z0-9]+/).filter(t => t && !stop.has(t));
-}
-function teamNameMatch(a, b) {
-  const na = normalizeTeamName(a), nb = normalizeTeamName(b);
-  if (!na || !nb) return false;
-  if (na === nb || na.includes(nb) || nb.includes(na)) return true;
-  const A = teamTokens(a), B = teamTokens(b);
-  if (!A.length || !B.length) return false;
-  const overlap = A.filter(x => B.includes(x)).length;
-  const minLen = Math.min(A.length, B.length);
-  return overlap >= 1 && (overlap >= minLen || overlap >= 2);
 }
 
 const SEED_SLIPS = [
@@ -765,8 +766,8 @@ const UPDATE_SLIPS = [
 
 async function loadSlips() {
   try {
-    const raw = localStorage.getItem('bet-slips');
-    slips = raw ? JSON.parse(raw) : null;
+    const result = await window.storage.get('bet-slips');
+    slips = result ? JSON.parse(result.value) : null;
     if (slips === null) {
       slips = [];
     }
@@ -821,7 +822,7 @@ async function loadSlips() {
 
 async function saveSlips() {
   try {
-    localStorage.setItem('bet-slips', JSON.stringify(slips));
+    await window.storage.set('bet-slips', JSON.stringify(slips));
   } catch (e) {
     console.error('Save failed', e);
   }
@@ -870,8 +871,8 @@ function renderSlips() {
 
 async function loadBalance() {
   try {
-    const raw = localStorage.getItem('bankroll-balance');
-    balance = raw ? parseFloat(raw) : null;
+    const result = await window.storage.get('bankroll-balance');
+    balance = result ? parseFloat(result.value) : null;
     if (balance === null || isNaN(balance)) {
       balance = 2500;
       await saveBalance();
@@ -884,7 +885,7 @@ async function loadBalance() {
 
 async function saveBalance() {
   try {
-    localStorage.setItem('bankroll-balance', String(balance));
+    await window.storage.set('bankroll-balance', String(balance));
   } catch (e) {
     console.error('Save failed', e);
   }
@@ -1054,8 +1055,8 @@ const UPDATE_ENTRIES = [
 
 async function loadEntries() {
   try {
-    const raw = localStorage.getItem('bet-entries');
-    entries = raw ? JSON.parse(raw) : null;
+    const result = await window.storage.get('bet-entries');
+    entries = result ? JSON.parse(result.value) : null;
     if (entries === null) {
       entries = [];
     }
@@ -1105,7 +1106,7 @@ async function loadEntries() {
 
 async function saveEntries() {
   try {
-    localStorage.setItem('bet-entries', JSON.stringify(entries));
+    await window.storage.set('bet-entries', JSON.stringify(entries));
   } catch (e) {
     console.error('Save failed', e);
   }
@@ -1500,16 +1501,10 @@ async function init() {
   if (savedKey) {
     document.getElementById('apiKeyInput').value = savedKey;
     document.getElementById('apiKeyStatus').textContent = 'Key saved. Tap Refresh to fetch live scores.';
-    await fetchLiveScoresFromApi(savedKey);
-    setInterval(async () => {
-      const key = await loadApiKey();
-      if (key) await fetchLiveScoresFromApi(key);
-    }, 60000);
   }
 }
 init();
 </script>
 
-<div style="display:none" aria-hidden="true">Netlify live-score integration enabled</div>
 </body>
 </html>
