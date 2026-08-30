@@ -682,59 +682,126 @@ async function fetchLiveScoresFromApi() {
   let fetchError = null;
   let sampleApiNames = [];
 
+  function cleanName(name) {
+    return (name || '')
+      .toLowerCase()
+      .replace(/&/g, 'and')
+      .replace(/[^a-z0-9]/g, '');
+  }
+
+  function teamNamesMatch(apiName, entryName) {
+    const a = cleanName(apiName);
+    const b = cleanName(entryName);
+
+    if (!a || !b) return false;
+
+    // Exact normalized match is safest.
+    if (a === b) return true;
+
+    // Only allow a loose match when one full name contains the other.
+    return a.length >= 5 && b.length >= 5 &&
+           (a.includes(b) || b.includes(a));
+  }
+
   for (const date of uniqueDates) {
     try {
-      const resp = await fetch(`/.netlify/functions/scores?date=${encodeURIComponent(date)}`);
+      const resp = await fetch(
+        `/.netlify/functions/scores?date=${encodeURIComponent(date)}`
+      );
+
       if (!resp.ok) {
         fetchError = `API error: ${resp.status}`;
         continue;
       }
+
       const data = await resp.json();
-      const fixtures = data.response || [];
+      const fixtures = Array.isArray(data.response) ? data.response : [];
 
       if (sampleApiNames.length === 0 && fixtures.length > 0) {
-        sampleApiNames = fixtures.slice(0, 6).map(f => `${f.teams.home.name} vs ${f.teams.away.name}`);
+        sampleApiNames = fixtures
+          .filter(f => f && f.teams && f.teams.home && f.teams.away)
+          .slice(0, 6)
+          .map(f => `${f.teams.home.name} vs ${f.teams.away.name}`);
       }
 
       for (const entry of pendingEntries.filter(e => e.date === date)) {
-        const parts = entry.match.split(' vs ');
+        const parts = (entry.match || '').split(/\s+vs\s+/i);
+
         if (parts.length !== 2) continue;
-        const [homeGuess, awayGuess] = parts;
 
-        const fixture = fixtures.find(f =>
-          namesLooselyMatch(f.teams.home.name, homeGuess) &&
-          namesLooselyMatch(f.teams.away.name, awayGuess)
-        );
+        const homeGuess = parts[0].trim();
+        const awayGuess = parts[1].trim();
 
-        if (fixture) {
-          const score = `${fixture?.goals?.home ?? 0}-${fixture?.goals?.away ?? 0}`;
-          const status = formatFixtureStatus(fixture);
-          const key = scoreKey(entry.match, entry.date);
-          matchScores[key] = { score, status };
-          matchedCount++;
+        // Only use fixtures where BOTH teams match in the correct home/away order.
+        const matchingFixtures = fixtures.filter(f => {
+          if (!f || !f.teams || !f.teams.home || !f.teams.away) {
+            return false;
+          }
+
+          return (
+            teamNamesMatch(f.teams.home.name, homeGuess) &&
+            teamNamesMatch(f.teams.away.name, awayGuess)
+          );
+        });
+
+        // Do not guess if multiple fixtures somehow match.
+        if (matchingFixtures.length !== 1) {
+          continue;
         }
+
+        const fixture = matchingFixtures[0];
+
+        const homeGoals = fixture?.goals?.home;
+        const awayGoals = fixture?.goals?.away;
+
+        const score =
+          `${homeGoals ?? 0}-${awayGoals ?? 0}`;
+
+        const status = formatFixtureStatus(fixture);
+
+        const key = scoreKey(entry.match, entry.date);
+
+        matchScores[key] = {
+          score,
+          status
+        };
+
+        matchedCount++;
       }
+
     } catch (e) {
-  console.error('Score processing error:', e);
-  fetchError = `Score update error: ${e.message || 'Unknown error'}`;
+      console.error('Score processing error:', e);
+      fetchError = `Score update error: ${e.message || 'Unknown error'}`;
     }
   }
 
   try {
-    await window.storage.set('match-scores', JSON.stringify(matchScores));
+    await window.storage.set(
+      'match-scores',
+      JSON.stringify(matchScores)
+    );
   } catch (e) {
-    console.error('Save failed', e);
+    console.error('Save failed:', e);
   }
 
   if (statusEl) {
     if (fetchError) {
-      statusEl.innerHTML = `⚠️ ${fetchError} If this persists, the API may be blocking direct browser calls — ask Claude to fetch scores instead.`;
+      statusEl.textContent = `⚠️ ${fetchError}`;
       statusEl.style.color = '#f87171';
-    } else if (matchedCount === 0 && sampleApiNames.length > 0) {
-      statusEl.innerHTML = `⚠️ Matched 0 of ${pendingEntries.length} — names aren't lining up. API returned matches like: ${escapeHtml(sampleApiNames.join(' | '))}`;
+    } else if (
+      matchedCount === 0 &&
+      sampleApiNames.length > 0
+    ) {
+      statusEl.innerHTML =
+        `⚠️ Matched 0 of ${pendingEntries.length}. ` +
+        `API returned examples: ` +
+        `${escapeHtml(sampleApiNames.join(' | '))}`;
+
       statusEl.style.color = '#fbbf24';
     } else {
-      statusEl.textContent = `✅ Matched ${matchedCount} of ${pendingEntries.length} pending legs.`;
+      statusEl.textContent =
+        `✅ Matched ${matchedCount} of ${pendingEntries.length} pending legs.`;
+
       statusEl.style.color = '#4ade80';
     }
   }
