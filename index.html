@@ -611,12 +611,9 @@ async function refreshAll() {
   await loadEntries();
   renderSlips();
 
-  const key = await loadApiKey();
-  if (key) {
-    await fetchLiveScoresFromApi(key);
-    await loadScores();
-    renderSlips();
-  }
+  await fetchLiveScoresFromApi();
+  await loadScores();
+  renderSlips();
   btn.textContent = '🔄 Refresh';
 }
 
@@ -667,7 +664,7 @@ function formatFixtureStatus(fixture) {
   return short;
 }
 
-async function fetchLiveScoresFromApi(apiKey) {
+async function fetchLiveScoresFromApi() {
   const statusEl = document.getElementById('apiKeyStatus');
   const pendingEntries = entries.filter(e => e.status === 'pending' && e.date);
   const uniqueDates = [...new Set(pendingEntries.map(e => e.date))];
@@ -683,7 +680,7 @@ async function fetchLiveScoresFromApi(apiKey) {
 
   for (const date of uniqueDates) {
     try {
-      const resp = await fetch(`/.netlify/functions/scores?date=${encodeURIComponent(date)}`);
+      const resp = await fetch(`/.netlify/functions/scores?date=${encodeURIComponent(date)}&key=${encodeURIComponent(apiKey)}`);
       if (!resp.ok) {
         fetchError = `API error: ${resp.status}`;
         continue;
