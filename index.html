@@ -1208,7 +1208,195 @@ async function saveEntries() {
     console.error('Save failed', e);
   }
 }
+function cleanName(name) {
+  return (name || '')
+    .toLowerCase()
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]/g, '');
+}
+ // Automatically settle individual bet legs from the final fixture result.
+function settleEntryFromFixture(entry, fixture) {
+  if (!entry || !fixture) return false;
 
+  const status = fixture?.status || {};
+  const short = String(status.short || '').toUpperCase();
+  const long = String(status.long || '').toLowerCase();
+
+  // Only settle genuinely finished matches.
+  const finished =
+    short === 'FT' ||
+    short === 'AET' ||
+    short === 'PEN' ||
+    long.includes('match finished') ||
+    long.includes('finished');
+
+  if (!finished) return false;
+
+  const homeGoals = fixture?.goals?.home;
+  const awayGoals = fixture?.goals?.away;
+
+  if (homeGoals == null || awayGoals == null) return false;
+
+  const home = Number(homeGoals);
+  const away = Number(awayGoals);
+
+  const parts = (entry.match || '').split(/\s+vs\s+/i);
+  if (parts.length !== 2) return false;
+
+  const homeTeam = parts[0].trim();
+  const awayTeam = parts[1].trim();
+
+  const market = String(entry.market || '').toLowerCase();
+
+  let hit = false;
+
+  // --------------------------------------------------
+  // TOTAL OVER 0.5
+  // --------------------------------------------------
+  if (market.includes('total over 0.5')) {
+    const teamName = market
+      .replace('total over 0.5', '')
+      .trim();
+
+    const normalizedBetTeam = cleanName(teamName);
+    const normalizedHome = cleanName(homeTeam);
+    const normalizedAway = cleanName(awayTeam);
+
+    if (
+      normalizedBetTeam &&
+      normalizedHome &&
+      normalizedBetTeam === normalizedHome
+    ) {
+      hit = home > 0;
+    } else if (
+      normalizedBetTeam &&
+      normalizedAway &&
+      normalizedBetTeam === normalizedAway
+    ) {
+      hit = away > 0;
+    } else {
+      return false;
+    }
+  }
+
+  // --------------------------------------------------
+  // TOTAL UNDER 1.5
+  // --------------------------------------------------
+  else if (market.includes('total under 1.5')) {
+    const teamName = market
+      .replace('total under 1.5', '')
+      .trim();
+
+    const normalizedBetTeam = cleanName(teamName);
+    const normalizedHome = cleanName(homeTeam);
+    const normalizedAway = cleanName(awayTeam);
+
+    if (
+      normalizedBetTeam &&
+      normalizedBetTeam === normalizedHome
+    ) {
+      hit = home < 2;
+    } else if (
+      normalizedBetTeam &&
+      normalizedBetTeam === normalizedAway
+    ) {
+      hit = away < 2;
+    } else {
+      return false;
+    }
+  }
+
+  // --------------------------------------------------
+  // WIN EITHER HALF
+  // --------------------------------------------------
+  else if (market.includes('win either half')) {
+    const teamName = market
+      .replace('win either half', '')
+      .trim();
+
+    const normalizedBetTeam = cleanName(teamName);
+    const normalizedHome = cleanName(homeTeam);
+    const normalizedAway = cleanName(awayTeam);
+
+    // API-Football normally provides half-time score here.
+    const htHome = Number(fixture?.score?.halftime?.home);
+    const htAway = Number(fixture?.score?.halftime?.away);
+
+    if (
+      !Number.isFinite(htHome) ||
+      !Number.isFinite(htAway)
+    ) {
+      return false;
+    }
+
+    if (normalizedBetTeam === normalizedHome) {
+      const firstHalfWin = htHome > htAway;
+      const secondHalfWin = (home - htHome) > (away - htAway);
+      hit = firstHalfWin || secondHalfWin;
+    } else if (normalizedBetTeam === normalizedAway) {
+      const firstHalfWin = htAway > htHome;
+      const secondHalfWin = (away - htAway) > (home - htHome);
+      hit = firstHalfWin || secondHalfWin;
+    } else {
+      return false;
+    }
+  }
+
+  else {
+    // Unknown market — do not guess.
+    return false;
+  }
+
+  const newStatus = hit ? 'hit' : 'miss';
+
+  if (entry.status !== newStatus) {
+    entry.status = newStatus;
+    return true;
+  }
+
+  return false;
+}
+
+
+// Automatically determine the overall result of every parlay.
+function settleParlays() {
+  const parlayNames = [
+    ...new Set(
+      entries
+        .map(e => e.slip)
+        .filter(Boolean)
+    )
+  ];
+
+  for (const parlayName of parlayNames) {
+    const legs = entries.filter(e => e.slip === parlayName);
+
+    if (!legs.length) continue;
+
+    // One missed leg means the entire parlay loses.
+    if (legs.some(e => e.status === 'miss')) {
+      const slip = slips.find(s =>
+        s.note && s.note.includes(parlayName)
+      );
+
+      if (slip && slip.result !== 'lost') {
+        slip.result = 'lost';
+      }
+
+      continue;
+    }
+
+    // All legs must be hit before the parlay can be won.
+    if (legs.every(e => e.status === 'hit')) {
+      const slip = slips.find(s =>
+        s.note && s.note.includes(parlayName)
+      );
+
+      if (slip && slip.result !== 'won') {
+        slip.result = 'won';
+      }
+    }
+  }
 function render() {
   renderLiveMatches();
 
