@@ -653,19 +653,47 @@ function namesLooselyMatch(a, b) {
 }
 
 function formatFixtureStatus(fixture) {
-  const short = fixture?.status?.short ?? 'NS';
-  const elapsed = fixture?.status?.elapsed ?? null;
+  const status = fixture?.status || {};
+  const short = String(status.short || '').toUpperCase();
+  const long = String(status.long || '').toLowerCase();
+  const elapsed = status.elapsed ?? null;
 
-  if (short === 'NS') return 'Not started';
-  if (short === 'HT') return 'HT';
-  if (short === 'FT' || short === 'AET' || short === 'PEN') return 'FT';
-  if (short === 'PST') return 'Postponed';
-  if (short === 'CANC') return 'Cancelled';
-  if (short === '1H' || short === '2H' || short === 'ET') {
-    return elapsed ? `${elapsed}'` : short;
+  if (
+    short === 'FT' ||
+    short === 'AET' ||
+    short === 'PEN' ||
+    long.includes('match finished') ||
+    long.includes('finished')
+  ) {
+    return 'FT';
   }
 
-  return short;
+  if (short === 'HT' || long.includes('halftime')) {
+    return 'HT';
+  }
+
+  if (
+    short === '1H' ||
+    short === '2H' ||
+    short === 'ET' ||
+    short === 'LIVE'
+  ) {
+    return elapsed != null ? `${elapsed}'` : 'LIVE';
+  }
+
+  if (short === 'PST' || long.includes('postponed')) {
+    return 'Postponed';
+  }
+
+  if (short === 'CANC' || long.includes('cancelled')) {
+    return 'Cancelled';
+  }
+
+  if (short === 'NS' || long.includes('not started')) {
+    return 'Not started';
+  }
+
+  return short || 'Unknown';
 }
 
 async function fetchLiveScoresFromApi() {
