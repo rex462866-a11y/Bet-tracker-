@@ -680,7 +680,7 @@ async function fetchLiveScoresFromApi() {
 
   for (const date of uniqueDates) {
     try {
-      const resp = await fetch(`/.netlify/functions/scores?date=${encodeURIComponent(date)}&key=${encodeURIComponent(apiKey)}`);
+      const resp = await fetch(`/.netlify/functions/scores?date=${encodeURIComponent(date)}`);
       if (!resp.ok) {
         fetchError = `API error: ${resp.status}`;
         continue;
