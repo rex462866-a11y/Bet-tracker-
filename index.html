@@ -711,7 +711,8 @@ async function fetchLiveScoresFromApi() {
         }
       }
     } catch (e) {
-      fetchError = 'Could not reach the scores function — check the netlify.toml and functions folder deployed correctly.';
+  console.error('Score processing error:', e);
+  fetchError = `Score update error: ${e.message || 'Unknown error'}`;
     }
   }
 
