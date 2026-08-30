@@ -653,14 +653,18 @@ function namesLooselyMatch(a, b) {
 }
 
 function formatFixtureStatus(fixture) {
-  const short = fixture.status.short;
-  const elapsed = fixture.status.elapsed;
+  const short = fixture?.status?.short ?? 'NS';
+  const elapsed = fixture?.status?.elapsed ?? null;
+
   if (short === 'NS') return 'Not started';
   if (short === 'HT') return 'HT';
   if (short === 'FT' || short === 'AET' || short === 'PEN') return 'FT';
   if (short === 'PST') return 'Postponed';
   if (short === 'CANC') return 'Cancelled';
-  if (short === '1H' || short === '2H' || short === 'ET') return elapsed ? `${elapsed}'` : short;
+  if (short === '1H' || short === '2H' || short === 'ET') {
+    return elapsed ? `${elapsed}'` : short;
+  }
+
   return short;
 }
 
@@ -703,7 +707,7 @@ async function fetchLiveScoresFromApi() {
         );
 
         if (fixture) {
-          const score = `${fixture.goals.home ?? 0}-${fixture.goals.away ?? 0}`;
+          const score = `${fixture?.goals?.home ?? 0}-${fixture?.goals?.away ?? 0}`;
           const status = formatFixtureStatus(fixture);
           const key = scoreKey(entry.match, entry.date);
           matchScores[key] = { score, status };
