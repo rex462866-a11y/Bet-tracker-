@@ -700,12 +700,38 @@ function formatFixtureStatus(fixture) {
   const long = String(status.long || '').toLowerCase();
   const elapsed = status.elapsed ?? null;
 
+  // API-Football occasionally returns an incomplete/odd status while still
+  // returning the final goals. For fixtures from a previous calendar date,
+  // a returned fixture with goals is treated as finished unless it explicitly
+  // says postponed/cancelled/abandoned.
+  const fixtureDate = fixture?.fixture?.date ? new Date(fixture.fixture.date) : null;
+  const today = new Date();
+  const previousDay = fixtureDate && (
+    fixtureDate.getFullYear() < today.getFullYear() ||
+    (fixtureDate.getFullYear() === today.getFullYear() &&
+      fixtureDate.getMonth() < today.getMonth()) ||
+    (fixtureDate.getFullYear() === today.getFullYear() &&
+      fixtureDate.getMonth() === today.getMonth() &&
+      fixtureDate.getDate() < today.getDate())
+  );
+
   if (
     ['FT', 'AET', 'PEN', 'AWD', 'WO'].includes(short) ||
     long.includes('match finished') ||
     long === 'finished' ||
     long.includes('finished after')
   ) return 'FT';
+
+  if (short === 'PST' || long.includes('postponed')) return 'Postponed';
+  if (short === 'CANC' || long.includes('cancelled')) return 'Cancelled';
+  if (short === 'ABD' || long.includes('abandoned')) return 'Abandoned';
+
+  // If this is an older fixture and the API supplied goals, do not show it
+  // as live/unknown just because its status field is stale or missing.
+  if (previousDay && fixture?.goals &&
+      fixture.goals.home != null && fixture.goals.away != null) {
+    return 'FT';
+  }
 
   if (short === 'HT' || long.includes('halftime')) return 'HT';
 
@@ -717,9 +743,6 @@ function formatFixtureStatus(fixture) {
   if (short === 'P') return 'Penalties';
   if (short === 'SUSP' || long.includes('suspended')) return 'Suspended';
   if (short === 'INT' || long.includes('interrupted')) return 'Interrupted';
-  if (short === 'PST' || long.includes('postponed')) return 'Postponed';
-  if (short === 'CANC' || long.includes('cancelled')) return 'Cancelled';
-  if (short === 'ABD' || long.includes('abandoned')) return 'Abandoned';
   if (short === 'TBD' || short === 'NS' || long.includes('not started')) return 'Not started';
 
   return short || (long ? long.replace(/^./, c => c.toUpperCase()) : 'Unknown');
@@ -729,12 +752,29 @@ function isFinishedFixture(fixture) {
   const status = fixture?.status || {};
   const short = String(status.short || '').toUpperCase();
   const long = String(status.long || '').toLowerCase();
-  return (
+
+  if (
     ['FT', 'AET', 'PEN', 'AWD', 'WO'].includes(short) ||
     long.includes('match finished') ||
     long === 'finished' ||
     long.includes('finished after')
+  ) return true;
+
+  // For a fixture dated before today, API-Football may occasionally expose
+  // a stale status even though the final score is already present.
+  const fixtureDate = fixture?.fixture?.date ? new Date(fixture.fixture.date) : null;
+  const today = new Date();
+  const previousDay = fixtureDate && (
+    fixtureDate.getFullYear() < today.getFullYear() ||
+    (fixtureDate.getFullYear() === today.getFullYear() &&
+      fixtureDate.getMonth() < today.getMonth()) ||
+    (fixtureDate.getFullYear() === today.getFullYear() &&
+      fixtureDate.getMonth() === today.getMonth() &&
+      fixtureDate.getDate() < today.getDate())
   );
+
+  return Boolean(previousDay && fixture?.goals &&
+    fixture.goals.home != null && fixture.goals.away != null);
 }
 
 function extractBetTeam(market) {
@@ -830,7 +870,20 @@ function settleParlays() {
     }
 
     if (newResult && slip.result !== newResult) {
+      const previous = slip.result;
       slip.result = newResult;
+
+      // Stakes are charged when the slip is created. Therefore a loss does
+      // not subtract the stake a second time; a win returns the payout.
+      if (newResult === 'won' && previous !== 'won' && !slip.payoutCredited) {
+        balance += Number(slip.payout || 0);
+        slip.payoutCredited = true;
+      }
+      if (previous === 'won' && newResult !== 'won' && slip.payoutCredited) {
+        balance -= Number(slip.payout || 0);
+        slip.payoutCredited = false;
+      }
+
       changed = true;
     }
   }
@@ -1006,13 +1059,26 @@ async function loadSlips() {
       }
     }
   }
+  // Historical MERGE_SLIPS were not charged to the bankroll by the older
+  // version of the tracker. Charge each such stake exactly once now.
+  for (const ms of MERGE_SLIPS) {
+    const target = slips.find(s => s.id === ms.id);
+    if (!target || !Number(target.stake)) continue;
+    if (target.stakeCharged !== true) {
+      balance -= Number(target.stake || 0);
+      target.stakeCharged = true;
+      changed = true;
+      balanceChanged = true;
+    }
+  }
+
   for (const upd of UPDATE_SLIPS) {
     const target = slips.find(s => s.id === upd.id);
     if (target && target.result !== upd.result) {
       const prevResult = target.result;
       target.result = upd.result;
       if (prevResult === 'won') balance -= (target.payout || 0);
-      if (upd.result === 'won') balance += (target.payout || 0);
+      if (upd.result === 'won') { balance += (target.payout || 0); target.payoutCredited = true; }
       changed = true;
       balanceChanged = true;
     }
@@ -1117,12 +1183,27 @@ function renderBankroll() {
 window.markSlipResult = async function(id, result) {
   const slip = slips.find(s => s.id === id);
   if (!slip) return;
+
   const prevResult = slip.result;
   slip.result = result;
 
-  // Adjust balance: reverse any prior settlement effect, then apply the new one.
-  if (prevResult === 'won') balance -= (slip.payout || 0);
-  if (result === 'won') balance += (slip.payout || 0);
+  // Make sure a manually-created/historical slip has its stake charged once.
+  if (Number(slip.stake || 0) > 0 && slip.stakeCharged !== true) {
+    balance -= Number(slip.stake || 0);
+    slip.stakeCharged = true;
+  }
+
+  // Reverse a previous payout if changing away from WON.
+  if (prevResult === 'won' && result !== 'won' && slip.payoutCredited) {
+    balance -= Number(slip.payout || 0);
+    slip.payoutCredited = false;
+  }
+
+  // Credit a win exactly once.
+  if (result === 'won' && !slip.payoutCredited) {
+    balance += Number(slip.payout || 0);
+    slip.payoutCredited = true;
+  }
 
   await saveSlips();
   await saveBalance();
@@ -1131,10 +1212,15 @@ window.markSlipResult = async function(id, result) {
 
 window.deleteSlip = async function(id) {
   const slip = slips.find(s => s.id === id);
-  if (slip && slip.result === 'won') {
-    balance -= (slip.payout || 0);
+  if (!slip) return;
+
+  // Deleting a settled win removes only the payout that had been credited.
+  // The stake was already charged when the bet was placed.
+  if (slip.result === 'won' && slip.payoutCredited) {
+    balance -= Number(slip.payout || 0);
     await saveBalance();
   }
+
   slips = slips.filter(s => s.id !== id);
   await saveSlips();
   renderSlips();
@@ -1615,7 +1701,9 @@ document.getElementById('slipForm').addEventListener('submit', async (ev) => {
   slips.push({
     id: Date.now().toString() + Math.random().toString(36).slice(2, 6),
     date, result, stake, payout, note,
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    stakeCharged: stake > 0,
+    payoutCredited: result === 'won' && payout > 0
   });
 
   // Placing a bet removes the stake from balance immediately.
