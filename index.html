@@ -943,17 +943,40 @@ async function fetchLiveScoresFromApi(apiKey) {
 
   for (const date of uniqueDates) {
     try {
+      // The Netlify function expects the user's API key in a request header.
+      // Keep the date in the query string. The extra key query parameter is
+      // included only for compatibility with older deployments.
       const resp = await fetch(
-        `/.netlify/functions/scores?date=${encodeURIComponent(date)}&key=${encodeURIComponent(apiKey)}`
+        `/.netlify/functions/scores?date=${encodeURIComponent(date)}&key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'GET',
+          headers: {
+            'x-client-api-key': apiKey,
+            'Accept': 'application/json'
+          }
+        }
       );
 
       if (!resp.ok) {
-        fetchError = `API error: ${resp.status}`;
+        let detail = '';
+        try { detail = await resp.text(); } catch (_) {}
+        fetchError = `Scores function returned ${resp.status}${detail ? ': ' + detail.slice(0, 180) : ''}`;
         continue;
       }
 
       const data = await resp.json();
-      const fixtures = Array.isArray(data?.response) ? data.response : [];
+
+      // Support both a normal API-Football response and a function that
+      // accidentally wraps that response one extra level.
+      const fixtures =
+        Array.isArray(data?.response) ? data.response :
+        Array.isArray(data?.data?.response) ? data.data.response :
+        Array.isArray(data?.fixtures) ? data.fixtures :
+        [];
+
+      if (!fixtures.length && (data?.errors || data?.message)) {
+        fetchError = `Scores API returned no fixtures: ${JSON.stringify(data.errors || data.message).slice(0, 180)}`;
+      }
 
       for (const entry of pendingEntries.filter(e => e.date === date)) {
         const fixture = findFixtureForEntry(fixtures, entry);
