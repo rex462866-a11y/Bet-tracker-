@@ -557,15 +557,15 @@ async function loadScores() {
   }
 }
 
-function isLiveStatus(status) {
-  const s = String(status || '').trim().toUpperCase();
-  return s === 'HT' || s === 'LIVE' || s === 'BREAK' || s === 'PENALTIES' || /^\d{1,3}'$/.test(s);
-}
-
 function renderLiveMatches() {
   const liveKeys = Object.keys(matchScores).filter(k => {
     const s = matchScores[k];
-    return s && isLiveStatus(s.status);
+    if (!s || !s.status) return false;
+    const status = s.status.toString().trim().toUpperCase();
+    return status !== 'FT' &&
+           status !== 'NOT STARTED' &&
+           status !== 'UNKNOWN' &&
+           status !== '';
   });
 
   const cardsEl = document.getElementById('liveCards');
@@ -586,7 +586,7 @@ function renderLiveMatches() {
   liveHeaderText.textContent = `Live Now (${liveKeys.length})`;
 
   cardsEl.innerHTML = liveKeys.map(k => {
-    const [match] = k.split('|');
+    const [match, date] = k.split('|');
     const s = matchScores[k];
     const relatedEntry = entries.find(e => scoreKey(e.match, e.date) === k);
     const league = relatedEntry ? relatedEntry.league : '';
@@ -608,7 +608,6 @@ function renderLiveMatches() {
 async function refreshAll() {
   const btn = document.getElementById('refreshBtn');
   btn.textContent = '⏳ Refreshing...';
-  btn.disabled = true;
 
   try {
     await loadBalance();
@@ -617,20 +616,16 @@ async function refreshAll() {
     await loadEntries();
 
     const key = await loadApiKey();
-    if (!key) {
-      const statusEl = document.getElementById('apiKeyStatus');
-      if (statusEl) {
-        statusEl.textContent = 'Paste your API-Football key above, then tap Save and Refresh.';
-        statusEl.style.color = '#fbbf24';
-      }
+    if (key) {
+      await fetchLiveScoresFromApi(key);
+    } else {
+      await settleParlaysFromEntries();
       render();
       renderSlips();
-      return;
     }
-
-    await fetchLiveScoresFromApi(key);
+  } catch (e) {
+    console.error('Refresh failed:', e);
   } finally {
-    btn.disabled = false;
     btn.textContent = '🔄 Refresh';
   }
 }
@@ -664,34 +659,68 @@ function normalizeTeamName(name) {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
-    .replace(/&/g, ' and ')
-    .replace(/\bmunchen\b/g, 'munich')
-    .replace(/\bparis saint germain\b/g, 'psg')
-    .replace(/\bacademico de viseu\b/g, 'academico viseu')
-    .replace(/\bde\b|\bfc\b|\bsk\b|\bsc\b|\bcd\b|\bcf\b/g, ' ')
-    .replace(/[^a-z0-9]+/g, '')
-    .trim();
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function teamNameVariants(name) {
+  const n = normalizeTeamName(name);
+  const variants = new Set([n]);
+
+  // Common football naming differences.
+  const aliases = {
+    bayernmunchen: ['bayernmunich'],
+    bayernmunich: ['bayernmunchen'],
+    psg: ['parissaintgermain'],
+    parissaintgermain: ['psg'],
+    atletico: ['atleticomadrid'],
+    atleticomadrid: ['atletico'],
+    inter: ['intermilan'],
+    intermilan: ['inter'],
+    sportingcp: ['sportinglisbon'],
+    sportinglisbon: ['sportingcp'],
+    alhilalriyadh: ['alhilal'],
+    alhilal: ['alhilalriyadh'],
+    alahli: ['alahlijeddah'],
+    alahlii: ['alahlijeddah'],
+    alahliiijeddah: ['alahlijeddah'],
+    alahli: ['alahlijeddah'],
+    manchestercity: ['mancity'],
+    mancity: ['manchestercity'],
+    manchesterunited: ['manutd'],
+    manutd: ['manchesterunited'],
+    borussiadortmund: ['dortmund'],
+    dortmund: ['borussiadortmund'],
+    borussiamonchengladbach: ['monchengladbach'],
+    monchengladbach: ['borussiamonchengladbach'],
+    westbromwichalbion: ['westbrom'],
+    westbrom: ['westbromwichalbion'],
+    nottinghamforest: ['nottmforest'],
+    nottmforest: ['nottinghamforest'],
+    wolverhampton: ['wolves'],
+    wolves: ['wolverhampton'],
+    galatasaraysk: ['galatasaray'],
+    galatasaray: ['galatasaraysk']
+  };
+
+  for (const a of (aliases[n] || [])) variants.add(a);
+  return [...variants].filter(Boolean);
 }
 
 function namesLooselyMatch(a, b) {
-  const na = normalizeTeamName(a);
-  const nb = normalizeTeamName(b);
-  if (!na || !nb) return false;
-  if (na === nb) return true;
-  if (na.length >= 4 && nb.length >= 4 && (na.includes(nb) || nb.includes(na))) return true;
+  const av = teamNameVariants(a);
+  const bv = teamNameVariants(b);
+  if (!av.length || !bv.length) return false;
 
-  const stop = new Set(['fc','cf','sc','sv','afc','ac','club','fk','cd','the','de','da','do','la','el']);
-  const tokens = value => String(value || '')
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase().replace(/&/g, ' and ')
-    .split(/[^a-z0-9]+/)
-    .filter(x => x && !stop.has(x));
-
-  const A = tokens(a);
-  const B = tokens(b);
-  if (!A.length || !B.length) return false;
-  const overlap = A.filter(x => B.includes(x)).length;
-  return overlap >= Math.min(A.length, B.length) || overlap >= 2;
+  for (const x of av) {
+    for (const y of bv) {
+      if (x === y) return true;
+      if (x.length >= 5 && y.length >= 5 && (x.includes(y) || y.includes(x))) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function formatFixtureStatus(fixture) {
@@ -700,213 +729,217 @@ function formatFixtureStatus(fixture) {
   const long = String(status.long || '').toLowerCase();
   const elapsed = status.elapsed ?? null;
 
-  // API-Football occasionally returns an incomplete/odd status while still
-  // returning the final goals. For fixtures from a previous calendar date,
-  // a returned fixture with goals is treated as finished unless it explicitly
-  // says postponed/cancelled/abandoned.
-  const fixtureDate = fixture?.fixture?.date ? new Date(fixture.fixture.date) : null;
-  const today = new Date();
-  const previousDay = fixtureDate && (
-    fixtureDate.getFullYear() < today.getFullYear() ||
-    (fixtureDate.getFullYear() === today.getFullYear() &&
-      fixtureDate.getMonth() < today.getMonth()) ||
-    (fixtureDate.getFullYear() === today.getFullYear() &&
-      fixtureDate.getMonth() === today.getMonth() &&
-      fixtureDate.getDate() < today.getDate())
-  );
-
   if (
-    ['FT', 'AET', 'PEN', 'AWD', 'WO'].includes(short) ||
+    short === 'FT' ||
+    short === 'AET' ||
+    short === 'PEN' ||
     long.includes('match finished') ||
-    long === 'finished' ||
-    long.includes('finished after')
+    long.includes('finished')
   ) return 'FT';
-
-  if (short === 'PST' || long.includes('postponed')) return 'Postponed';
-  if (short === 'CANC' || long.includes('cancelled')) return 'Cancelled';
-  if (short === 'ABD' || long.includes('abandoned')) return 'Abandoned';
-
-  // If this is an older fixture and the API supplied goals, do not show it
-  // as live/unknown just because its status field is stale or missing.
-  if (previousDay && fixture?.goals &&
-      fixture.goals.home != null && fixture.goals.away != null) {
-    return 'FT';
-  }
 
   if (short === 'HT' || long.includes('halftime')) return 'HT';
 
-  if (['1H', '2H', 'ET', 'LIVE'].includes(short)) {
+  if (
+    short === '1H' ||
+    short === '2H' ||
+    short === 'ET' ||
+    short === 'LIVE' ||
+    short === '2H'
+  ) {
     return elapsed != null ? `${elapsed}'` : 'LIVE';
   }
 
-  if (short === 'BT') return 'Break';
-  if (short === 'P') return 'Penalties';
-  if (short === 'SUSP' || long.includes('suspended')) return 'Suspended';
-  if (short === 'INT' || long.includes('interrupted')) return 'Interrupted';
-  if (short === 'TBD' || short === 'NS' || long.includes('not started')) return 'Not started';
+  if (short === 'PST' || long.includes('postponed')) return 'Postponed';
+  if (short === 'CANC' || short === 'CANCELLED' || long.includes('cancelled')) return 'Cancelled';
 
-  return short || (long ? long.replace(/^./, c => c.toUpperCase()) : 'Unknown');
+  // API-Football can occasionally return an NS code while already supplying
+  // final goals. If the kickoff is safely in the past, treat that as FT.
+  const gh = fixture?.goals?.home;
+  const ga = fixture?.goals?.away;
+  const kickoff = fixture?.fixture?.date ? new Date(fixture.fixture.date).getTime() : NaN;
+  if (
+    short === 'NS' &&
+    gh != null &&
+    ga != null &&
+    Number.isFinite(kickoff) &&
+    kickoff < Date.now() - 2 * 60 * 60 * 1000
+  ) {
+    return 'FT';
+  }
+
+  if (short === 'NS' || long.includes('not started')) return 'Not started';
+
+  return short || 'Unknown';
 }
 
-function isFinishedFixture(fixture) {
+function fixtureIsFinished(fixture) {
   const status = fixture?.status || {};
   const short = String(status.short || '').toUpperCase();
   const long = String(status.long || '').toLowerCase();
 
   if (
-    ['FT', 'AET', 'PEN', 'AWD', 'WO'].includes(short) ||
+    short === 'FT' ||
+    short === 'AET' ||
+    short === 'PEN' ||
     long.includes('match finished') ||
-    long === 'finished' ||
-    long.includes('finished after')
+    long.includes('finished')
   ) return true;
 
-  // For a fixture dated before today, API-Football may occasionally expose
-  // a stale status even though the final score is already present.
-  const fixtureDate = fixture?.fixture?.date ? new Date(fixture.fixture.date) : null;
-  const today = new Date();
-  const previousDay = fixtureDate && (
-    fixtureDate.getFullYear() < today.getFullYear() ||
-    (fixtureDate.getFullYear() === today.getFullYear() &&
-      fixtureDate.getMonth() < today.getMonth()) ||
-    (fixtureDate.getFullYear() === today.getFullYear() &&
-      fixtureDate.getMonth() === today.getMonth() &&
-      fixtureDate.getDate() < today.getDate())
+  // Defensive fallback for the occasional stale NS response that contains
+  // final goals and has a kickoff more than two hours ago.
+  const gh = fixture?.goals?.home;
+  const ga = fixture?.goals?.away;
+  const kickoff = fixture?.fixture?.date ? new Date(fixture.fixture.date).getTime() : NaN;
+
+  return (
+    short === 'NS' &&
+    gh != null &&
+    ga != null &&
+    Number.isFinite(kickoff) &&
+    kickoff < Date.now() - 2 * 60 * 60 * 1000
   );
-
-  return Boolean(previousDay && fixture?.goals &&
-    fixture.goals.home != null && fixture.goals.away != null);
 }
 
-function extractBetTeam(market) {
-  return String(market || '')
-    .replace(/\b(total over 0\.5|total under 1\.5|win either half)\b/i, '')
-    .trim();
-}
-
-function settleEntryFromFixture(entry, fixture) {
-  if (!entry || !fixture || !isFinishedFixture(fixture)) return false;
+function marketResultFromFixture(entry, fixture) {
+  if (!entry || !fixture || !fixtureIsFinished(fixture)) return null;
 
   const homeGoals = fixture?.goals?.home;
   const awayGoals = fixture?.goals?.away;
-  if (homeGoals == null || awayGoals == null) return false;
+  if (homeGoals == null || awayGoals == null) return null;
 
   const home = Number(homeGoals);
   const away = Number(awayGoals);
   const parts = String(entry.match || '').split(/\s+vs\s+/i);
-  if (parts.length !== 2) return false;
+  if (parts.length !== 2) return null;
 
   const homeTeam = parts[0].trim();
   const awayTeam = parts[1].trim();
-  const market = String(entry.market || '').toLowerCase();
-  const betTeam = extractBetTeam(market);
-  const betIsHome = namesLooselyMatch(betTeam, homeTeam);
-  const betIsAway = namesLooselyMatch(betTeam, awayTeam);
+  const market = String(entry.market || '').toLowerCase().trim();
 
-  if (!betIsHome && !betIsAway) return false;
-
-  let hit = false;
-
+  // Team total over 0.5.
   if (market.includes('total over 0.5')) {
-    hit = betIsHome ? home > 0 : away > 0;
-  } else if (market.includes('total under 1.5')) {
-    hit = betIsHome ? home < 2 : away < 2;
-  } else if (market.includes('win either half')) {
-    const htHome = fixture?.score?.halftime?.home;
-    const htAway = fixture?.score?.halftime?.away;
+    const betTeam = market.replace('total over 0.5', '').trim();
+    if (namesLooselyMatch(betTeam, homeTeam)) return home > 0;
+    if (namesLooselyMatch(betTeam, awayTeam)) return away > 0;
+    return null;
+  }
 
-    // API-Football normally supplies halftime scores for finished fixtures.
-    // If halftime data is missing, a final win still guarantees the team won
-    // the second half OR first half, so it is safe to mark that case as hit.
-    if (htHome != null && htAway != null) {
-      const hth = Number(htHome);
-      const hta = Number(htAway);
-      const firstHalfWin = betIsHome ? hth > hta : hta > hth;
-      const secondHalfWin = betIsHome
-        ? (home - hth) > (away - hta)
-        : (away - hta) > (home - hth);
-      hit = firstHalfWin || secondHalfWin;
-    } else if (betIsHome) {
-      hit = home > away;
-    } else {
-      hit = away > home;
+  // Team total under 1.5.
+  if (market.includes('total under 1.5')) {
+    const betTeam = market.replace('total under 1.5', '').trim();
+    if (namesLooselyMatch(betTeam, homeTeam)) return home < 2;
+    if (namesLooselyMatch(betTeam, awayTeam)) return away < 2;
+    return null;
+  }
+
+  // Win Either Half:
+  // 1) team wins the first half, OR
+  // 2) team wins the second half.
+  if (market.includes('win either half')) {
+    const betTeam = market.replace('win either half', '').trim();
+
+    const htHome = Number(fixture?.score?.halftime?.home);
+    const htAway = Number(fixture?.score?.halftime?.away);
+
+    // Without halftime data we cannot safely determine "either half".
+    if (!Number.isFinite(htHome) || !Number.isFinite(htAway)) return null;
+
+    const secondHome = home - htHome;
+    const secondAway = away - htAway;
+
+    if (namesLooselyMatch(betTeam, homeTeam)) {
+      return htHome > htAway || secondHome > secondAway;
     }
-  } else {
-    // Unknown markets are never guessed automatically.
-    return false;
+
+    if (namesLooselyMatch(betTeam, awayTeam)) {
+      return htAway > htHome || secondAway > secondHome;
+    }
+
+    return null;
   }
 
-  const newStatus = hit ? 'hit' : 'miss';
-  if (entry.status !== newStatus) {
-    entry.status = newStatus;
-    return true;
-  }
-  return false;
+  return null;
 }
 
-function findSlipForParlay(parlayName) {
-  const match = String(parlayName || '').match(/(\d+)/);
-  if (match) {
-    const byId = slips.find(s => s.id === `slip${match[1]}`);
-    if (byId) return byId;
-  }
-  return slips.find(s => String(s.note || '').toLowerCase().includes(String(parlayName).toLowerCase())) || null;
+function findFixtureForEntry(fixtures, entry) {
+  const parts = String(entry?.match || '').split(/\s+vs\s+/i);
+  if (parts.length !== 2) return null;
+
+  const homeGuess = parts[0].trim();
+  const awayGuess = parts[1].trim();
+
+  const matches = (fixtures || []).filter(f =>
+    f?.teams?.home?.name &&
+    f?.teams?.away?.name &&
+    namesLooselyMatch(f.teams.home.name, homeGuess) &&
+    namesLooselyMatch(f.teams.away.name, awayGuess)
+  );
+
+  // Only use an unambiguous fixture.
+  return matches.length === 1 ? matches[0] : null;
 }
 
-function settleParlays() {
+async function settleParlaysFromEntries() {
   let changed = false;
+  let balanceChanged = false;
 
   const parlayNames = [...new Set(entries.map(e => e.slip).filter(Boolean))];
 
   for (const parlayName of parlayNames) {
     const legs = entries.filter(e => e.slip === parlayName);
-    const slip = findSlipForParlay(parlayName);
+    const slip = slips.find(s => s.note && s.note.includes(parlayName));
     if (!slip || !legs.length) continue;
 
-    let newResult = null;
+    let newResult = 'pending';
+
     if (legs.some(e => e.status === 'miss')) {
       newResult = 'lost';
     } else if (legs.every(e => e.status === 'hit')) {
       newResult = 'won';
     }
 
-    if (newResult && slip.result !== newResult) {
+    if (slip.result !== newResult) {
       const previous = slip.result;
       slip.result = newResult;
 
-      // Stakes are charged when the slip is created. Therefore a loss does
-      // not subtract the stake a second time; a win returns the payout.
-      if (newResult === 'won' && previous !== 'won' && !slip.payoutCredited) {
-        balance += Number(slip.payout || 0);
-        slip.payoutCredited = true;
-      }
-      if (previous === 'won' && newResult !== 'won' && slip.payoutCredited) {
+      // Stakes are removed when the bet is placed. Only the payout changes
+      // the balance when a slip becomes WON; reversing a previous WIN removes
+      // that payout again.
+      if (previous === 'won' && newResult !== 'won') {
         balance -= Number(slip.payout || 0);
-        slip.payoutCredited = false;
+        balanceChanged = true;
+      }
+      if (previous !== 'won' && newResult === 'won') {
+        balance += Number(slip.payout || 0);
+        balanceChanged = true;
       }
 
       changed = true;
     }
   }
 
+  if (changed) await saveSlips();
+  if (balanceChanged) await saveBalance();
+
   return changed;
 }
 
 async function fetchLiveScoresFromApi(apiKey) {
   const statusEl = document.getElementById('apiKeyStatus');
-  const entriesToCheck = entries.filter(e => e.date);
-  const pendingEntries = entriesToCheck.filter(e => e.status === 'pending');
-  const uniqueDates = [...new Set(entriesToCheck.map(e => e.date))];
+  const pendingEntries = entries.filter(e => e.status === 'pending' && e.date);
 
-  if (uniqueDates.length === 0) {
-    if (statusEl) statusEl.textContent = 'No games with dates to check.';
-    return { matchedCount: 0, settledCount: 0, error: null };
+  if (pendingEntries.length === 0) {
+    await settleParlaysFromEntries();
+    if (statusEl) statusEl.textContent = 'No pending games with dates to check.';
+    return;
   }
+
+  const uniqueDates = [...new Set(pendingEntries.map(e => e.date))];
 
   let matchedCount = 0;
   let settledCount = 0;
   let fetchError = null;
-  let sampleApiNames = [];
-  let entriesChanged = false;
+  const unmatched = [];
 
   for (const date of uniqueDates) {
     try {
@@ -920,41 +953,38 @@ async function fetchLiveScoresFromApi(apiKey) {
       }
 
       const data = await resp.json();
-      const fixtures = Array.isArray(data.response) ? data.response : [];
+      const fixtures = Array.isArray(data?.response) ? data.response : [];
 
-      if (sampleApiNames.length === 0 && fixtures.length > 0) {
-        sampleApiNames = fixtures
-          .filter(f => f?.teams?.home?.name && f?.teams?.away?.name)
-          .slice(0, 6)
-          .map(f => `${f.teams.home.name} vs ${f.teams.away.name}`);
-      }
+      for (const entry of pendingEntries.filter(e => e.date === date)) {
+        const fixture = findFixtureForEntry(fixtures, entry);
 
-      for (const entry of entriesToCheck.filter(e => e.date === date)) {
-        const parts = String(entry.match || '').split(/\s+vs\s+/i);
-        if (parts.length !== 2) continue;
+        if (!fixture) {
+          unmatched.push(entry.match);
+          continue;
+        }
 
-        const homeGuess = parts[0].trim();
-        const awayGuess = parts[1].trim();
-
-        const matchingFixtures = fixtures.filter(f =>
-          f?.teams?.home?.name &&
-          f?.teams?.away?.name &&
-          namesLooselyMatch(f.teams.home.name, homeGuess) &&
-          namesLooselyMatch(f.teams.away.name, awayGuess)
-        );
-
-        if (matchingFixtures.length !== 1) continue;
-
-        const fixture = matchingFixtures[0];
-        const score = `${fixture?.goals?.home ?? 0}-${fixture?.goals?.away ?? 0}`;
+        const homeGoals = fixture?.goals?.home;
+        const awayGoals = fixture?.goals?.away;
+        const score = `${homeGoals ?? 0}-${awayGoals ?? 0}`;
         const status = formatFixtureStatus(fixture);
         const key = scoreKey(entry.match, entry.date);
-        matchScores[key] = { score, status };
+
+        matchScores[key] = {
+          score,
+          status,
+          fixtureId: fixture?.fixture?.id ?? null,
+          minute: fixture?.status?.elapsed ?? null,
+          home: fixture?.teams?.home?.name || '',
+          away: fixture?.teams?.away?.name || '',
+          kickoff: fixture?.fixture?.date || null
+        };
+
         matchedCount++;
 
-        if (entry.status === 'pending' && settleEntryFromFixture(entry, fixture)) {
+        const result = marketResultFromFixture(entry, fixture);
+        if (result !== null) {
+          entry.status = result ? 'hit' : 'miss';
           settledCount++;
-          entriesChanged = true;
         }
       }
     } catch (e) {
@@ -963,37 +993,28 @@ async function fetchLiveScoresFromApi(apiKey) {
     }
   }
 
-  const parlaysChanged = settleParlays();
-  if (parlaysChanged) {
-    try {
-      await saveSlips();
-    } catch (e) {
-      console.error('Parlay save failed:', e);
-    }
-  }
-
-  if (entriesChanged) await saveEntries();
-
-  try {
-    await window.storage.set('match-scores', JSON.stringify(matchScores));
-  } catch (e) {
-    console.error('Score save failed:', e);
-  }
-
-  render();
-  renderSlips();
+  await window.storage.set('match-scores', JSON.stringify(matchScores));
+  await saveEntries();
+  await settleParlaysFromEntries();
 
   if (statusEl) {
     if (fetchError) {
       statusEl.textContent = `⚠️ ${fetchError}`;
       statusEl.style.color = '#f87171';
+    } else if (matchedCount === 0) {
+      statusEl.textContent =
+        `⚠️ Matched 0 of ${pendingEntries.length} pending legs. ` +
+        `The score API returned no unambiguous team matches.`;
+      statusEl.style.color = '#fbbf24';
     } else {
-      statusEl.textContent = `✅ Matched ${matchedCount} of ${entriesToCheck.length} dated legs • Settled ${settledCount} pending legs • Parlays update automatically when all legs are settled.`;
+      statusEl.textContent =
+        `✅ Matched ${matchedCount} of ${pendingEntries.length} pending legs` +
+        `${settledCount ? ` · Settled ${settledCount}` : ''}.`;
       statusEl.style.color = '#4ade80';
     }
   }
 
-  return { matchedCount, settledCount, error: fetchError };
+  render();
 }
 
 const SEED_SLIPS = [
@@ -1026,49 +1047,43 @@ async function loadSlips() {
   try {
     const result = await window.storage.get('bet-slips');
     slips = result ? JSON.parse(result.value) : null;
-    if (slips === null) {
-      slips = [];
-    }
+    if (!Array.isArray(slips)) slips = [];
   } catch (e) {
     slips = [];
   }
 
   let changed = false;
   let balanceChanged = false;
+
   if (slips.length === 0) {
     slips = SEED_SLIPS.slice();
     changed = true;
   }
+
   if (REMOVE_SLIP_IDS.length > 0) {
     const before = slips.length;
     slips = slips.filter(s => !REMOVE_SLIP_IDS.includes(s.id));
     if (slips.length !== before) changed = true;
   }
+
   const existingIds = new Set(slips.map(s => s.id));
+
   for (const ms of MERGE_SLIPS) {
     if (!existingIds.has(ms.id)) {
-      slips.push(ms);
+      slips.push({ ...ms });
       changed = true;
     } else {
       const target = slips.find(s => s.id === ms.id);
-      if (target.note !== ms.note || target.stake !== ms.stake || target.payout !== ms.payout) {
+      if (
+        target.note !== ms.note ||
+        target.stake !== ms.stake ||
+        target.payout !== ms.payout
+      ) {
         target.note = ms.note;
         target.stake = ms.stake;
         target.payout = ms.payout;
         changed = true;
       }
-    }
-  }
-  // Historical MERGE_SLIPS were not charged to the bankroll by the older
-  // version of the tracker. Charge each such stake exactly once now.
-  for (const ms of MERGE_SLIPS) {
-    const target = slips.find(s => s.id === ms.id);
-    if (!target || !Number(target.stake)) continue;
-    if (target.stakeCharged !== true) {
-      balance -= Number(target.stake || 0);
-      target.stakeCharged = true;
-      changed = true;
-      balanceChanged = true;
     }
   }
 
@@ -1077,18 +1092,22 @@ async function loadSlips() {
     if (target && target.result !== upd.result) {
       const prevResult = target.result;
       target.result = upd.result;
-      if (prevResult === 'won') balance -= (target.payout || 0);
-      if (upd.result === 'won') { balance += (target.payout || 0); target.payoutCredited = true; }
+
+      if (prevResult === 'won' && upd.result !== 'won') {
+        balance -= Number(target.payout || 0);
+        balanceChanged = true;
+      }
+      if (prevResult !== 'won' && upd.result === 'won') {
+        balance += Number(target.payout || 0);
+        balanceChanged = true;
+      }
+
       changed = true;
-      balanceChanged = true;
     }
   }
-  if (changed) {
-    await saveSlips();
-  }
-  if (balanceChanged) {
-    await saveBalance();
-  }
+
+  if (changed) await saveSlips();
+  if (balanceChanged) await saveBalance();
 }
 
 async function saveSlips() {
@@ -1185,24 +1204,14 @@ window.markSlipResult = async function(id, result) {
   if (!slip) return;
 
   const prevResult = slip.result;
+  if (prevResult === result) return;
+
   slip.result = result;
 
-  // Make sure a manually-created/historical slip has its stake charged once.
-  if (Number(slip.stake || 0) > 0 && slip.stakeCharged !== true) {
-    balance -= Number(slip.stake || 0);
-    slip.stakeCharged = true;
-  }
-
-  // Reverse a previous payout if changing away from WON.
-  if (prevResult === 'won' && result !== 'won' && slip.payoutCredited) {
+  if (prevResult === 'won' && result !== 'won') {
     balance -= Number(slip.payout || 0);
-    slip.payoutCredited = false;
-  }
-
-  // Credit a win exactly once.
-  if (result === 'won' && !slip.payoutCredited) {
+  } else if (prevResult !== 'won' && result === 'won') {
     balance += Number(slip.payout || 0);
-    slip.payoutCredited = true;
   }
 
   await saveSlips();
@@ -1214,9 +1223,7 @@ window.deleteSlip = async function(id) {
   const slip = slips.find(s => s.id === id);
   if (!slip) return;
 
-  // Deleting a settled win removes only the payout that had been credited.
-  // The stake was already charged when the bet was placed.
-  if (slip.result === 'won' && slip.payoutCredited) {
+  if (slip.result === 'won') {
     balance -= Number(slip.payout || 0);
     await saveBalance();
   }
@@ -1323,7 +1330,26 @@ const REMOVE_ENTRY_IDS = ['d2-1', 'd2-2', 'd2-3', 'd2-4', 'd2-5', 'd2-6', 'd2-7'
 
 // Force-apply status updates by id (used when results come in for legs already saved).
 // Format: { id: 'p2-1', status: 'hit' }
-const UPDATE_ENTRIES = [];
+const UPDATE_ENTRIES = [
+  { id: 'p2-1', status: 'hit' },
+  { id: 'p2-2', status: 'miss' },
+  { id: 'p2-3', status: 'hit' },
+  { id: 'p2-4', status: 'hit' },
+  { id: 'p2-5', status: 'hit' },
+  { id: 'p2-6', status: 'hit' },
+  { id: 'p2-7', status: 'hit' },
+  { id: 'p2-8', status: 'hit' },
+  { id: 'p2-9', status: 'hit' },
+  { id: 'p2-10', status: 'hit' },
+  { id: 'p3-1', status: 'hit' },
+  { id: 'p3-2', status: 'hit' },
+  { id: 'p3-3', status: 'hit' },
+  { id: 'p3-4', status: 'hit' },
+  { id: 'p3-5', status: 'hit' },
+  { id: 'p3-6', status: 'hit' },
+  { id: 'p3-7', status: 'hit' },
+  { id: 'p3-8', status: 'miss' }
+];
 
 async function loadEntries() {
   try {
@@ -1537,7 +1563,8 @@ function renderEntriesLive() {
     el.innerHTML = '<div class="empty">No legs logged yet.</div>';
     return;
   }
-  const list = [...entries];
+  const pending = entries.filter(e => e.status === 'pending');
+  const list = pending.length ? pending : entries;
   const sorted = [...list].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   el.innerHTML = sorted.map(e => {
     const sk = scoreKey(e.match, e.date);
@@ -1546,7 +1573,7 @@ function renderEntriesLive() {
       ? `<div class="score-bar"><span class="score">${escapeHtml(sc.score || '')}</span><span class="status${sc.status === 'FT' ? ' ft' : ''}">${escapeHtml(sc.status || '')}</span></div>`
       : `<div class="score-bar"><span class="no-score">Score not yet updated</span></div>`;
     return `
-      <div class="entry ${e.status === 'hit' ? 'hit' : e.status === 'miss' ? 'miss' : 'pending'}">
+      <div class="entry pending">
         ${scoreHtml}
         <div class="entry-top">
           <div>
@@ -1701,9 +1728,7 @@ document.getElementById('slipForm').addEventListener('submit', async (ev) => {
   slips.push({
     id: Date.now().toString() + Math.random().toString(36).slice(2, 6),
     date, result, stake, payout, note,
-    createdAt: Date.now(),
-    stakeCharged: stake > 0,
-    payoutCredited: result === 'won' && payout > 0
+    createdAt: Date.now()
   });
 
   // Placing a bet removes the stake from balance immediately.
@@ -1768,17 +1793,16 @@ async function init() {
   await loadScores();
   await loadSlips();
   await loadEntries();
+  await settleParlaysFromEntries();
   renderSlips();
 
   const savedKey = await loadApiKey();
   if (savedKey) {
     document.getElementById('apiKeyInput').value = savedKey;
-    document.getElementById('apiKeyStatus').textContent = 'Key saved. Tap Refresh to fetch scores and settle bets.';
-  } else {
-    document.getElementById('apiKeyStatus').textContent = 'No API key saved yet.';
+    document.getElementById('apiKeyStatus').textContent =
+      'Key saved. Tap Refresh to fetch live scores and settle pending legs.';
   }
 }
-
 init();
 </script>
 
